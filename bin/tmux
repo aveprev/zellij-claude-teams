@@ -335,7 +335,9 @@ split-window)
     zellij_args=(action new-pane --close-on-exit -d "$sw_direction")
 
     # Launch the wrapper in a new zellij pane.
-    zellij "${zellij_args[@]}" -- "${SHIM_DIR}/bin/zellij-pane-wrapper" "$STATE_DIR" "$SHIM_DIR" "$NEW_PANE_ID" &
+    # Redirect stdout/stderr — zellij prints the new pane ID (e.g. "terminal_25")
+    # which would leak into our output and corrupt the pane ID returned via -P.
+    zellij "${zellij_args[@]}" -- "${SHIM_DIR}/bin/zellij-pane-wrapper" "$STATE_DIR" "$SHIM_DIR" "$NEW_PANE_ID" > /dev/null 2>&1 &
 
     # Wait for wrapper to signal readiness (creates .ready sentinel)
     if ! wait_for_ready "$PANE_KEY"; then
@@ -607,7 +609,7 @@ new-window)
         zellij_args+=(-n "$nw_name")
     fi
 
-    zellij "${zellij_args[@]}" -- "${SHIM_DIR}/bin/zellij-pane-wrapper" "$STATE_DIR" "$SHIM_DIR" "$NEW_PANE_ID" &
+    zellij "${zellij_args[@]}" -- "${SHIM_DIR}/bin/zellij-pane-wrapper" "$STATE_DIR" "$SHIM_DIR" "$NEW_PANE_ID" > /dev/null 2>&1 &
 
     if ! wait_for_ready "$PANE_KEY"; then
         log_debug "new-window: pane ${NEW_PANE_ID} failed to become ready"

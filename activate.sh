@@ -8,8 +8,11 @@ if [ -z "$ZELLIJ" ]; then
     return 1 2>/dev/null || exit 1
 fi
 
-# Guard: don't double-activate
+# Guard: don't double-activate — but always re-ensure PATH priority.
+# Child shells inherit ZELLIJ_TMUX_SHIM_ACTIVE but rebuild PATH from
+# shell config, pushing the shim behind other entries (brew, cargo, etc.).
 if [ -n "$ZELLIJ_TMUX_SHIM_ACTIVE" ]; then
+    export PATH="${ZELLIJ_TMUX_SHIM_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/zellij-tmux-shim}/bin:${PATH}"
     return 0 2>/dev/null || exit 0
 fi
 
