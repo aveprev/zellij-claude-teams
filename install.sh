@@ -31,9 +31,11 @@ do_install() {
     mkdir -p "${INSTALL_DIR}/bin"
 
     # Copy scripts
-    cp "${SCRIPT_DIR}/activate.sh"   "${INSTALL_DIR}/activate.sh"
-    cp "${SCRIPT_DIR}/deactivate.sh" "${INSTALL_DIR}/deactivate.sh"
-    cp "${SCRIPT_DIR}/bin/tmux"      "${INSTALL_DIR}/bin/tmux"
+    cp "${SCRIPT_DIR}/activate.sh"     "${INSTALL_DIR}/activate.sh"
+    cp "${SCRIPT_DIR}/deactivate.sh"   "${INSTALL_DIR}/deactivate.sh"
+    cp "${SCRIPT_DIR}/activate.fish"   "${INSTALL_DIR}/activate.fish"
+    cp "${SCRIPT_DIR}/deactivate.fish" "${INSTALL_DIR}/deactivate.fish"
+    cp "${SCRIPT_DIR}/bin/tmux"        "${INSTALL_DIR}/bin/tmux"
     cp "${SCRIPT_DIR}/bin/zellij-pane-wrapper" "${INSTALL_DIR}/bin/zellij-pane-wrapper"
 
     # Ensure executables
@@ -63,6 +65,15 @@ if [[ -n "$ZELLIJ" ]]; then
     unset _shim
 fi
 ZSH_SNIPPET
+    echo ""
+    echo "=== For ~/.config/fish/config.fish ==="
+    cat <<'FISH_SNIPPET'
+# --- Zellij-tmux-shim (Claude Code agent teams in zellij) ---
+if set -q ZELLIJ
+    set -l _shim (set -q XDG_DATA_HOME; and echo $XDG_DATA_HOME; or echo $HOME/.local/share)/zellij-tmux-shim/activate.fish
+    test -f $_shim; and source $_shim
+end
+FISH_SNIPPET
     echo ""
     echo "Then restart your shell inside zellij."
 }

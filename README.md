@@ -25,7 +25,7 @@ Agent panes are named after their role and stack vertically on the right.
 ## Requirements
 
 - **Zellij** 0.40+ (tested on 0.43.1)
-- **Bash** 3.2+ (ships with macOS; Linux has 4+)
+- **Bash** 3.2+ for the shim binaries (ships with macOS; Linux has 4+) — your interactive shell can be bash, zsh, or fish 3.6+
 - **Claude Code** with Agent Teams support
 
 ## Installation
@@ -60,6 +60,14 @@ if [[ -n "$ZELLIJ" ]]; then
 fi
 ```
 
+**Fish** (`~/.config/fish/config.fish`):
+```fish
+if set -q ZELLIJ
+    set -l _shim (set -q XDG_DATA_HOME; and echo $XDG_DATA_HOME; or echo $HOME/.local/share)/zellij-tmux-shim/activate.fish
+    test -f $_shim; and source $_shim
+end
+```
+
 Then restart your shell inside Zellij.
 
 ### Workspace trust (one-time)
@@ -81,6 +89,12 @@ The shim activates automatically when you're inside Zellij (it checks for the `$
 
 ```bash
 source ~/.local/share/zellij-tmux-shim/deactivate.sh
+```
+
+Fish users source `deactivate.fish` instead:
+
+```fish
+source ~/.local/share/zellij-tmux-shim/deactivate.fish
 ```
 
 ### Uninstall
@@ -176,7 +190,6 @@ cat "${ZELLIJ_TMUX_SHIM_STATE}/shim.log"
 
 - **No pane resizing** — Zellij manages layout automatically; tmux layout commands are no-ops
 - **Fragile to Claude Code updates** — new tmux commands added upstream may need shim updates. Debug logging captures unhandled commands for diagnosis.
-- **No Fish shell support** — Fish cannot source bash scripts. Use [bass](https://github.com/edc/bass) or contribute a `activate.fish`.
 
 ## Compatibility
 
