@@ -143,9 +143,10 @@ start_command() {
     # group of the pane's PTY — so interactive programs (claude) keep TTY
     # access. stdin is restored from FD 4 (the real PTY) so it isn't the
     # /dev/null that backgrounding would otherwise assign; FD 3 (the FIFO) and
-    # FD 4 are closed for the child so it inherits neither. eval preserves
-    # serialize_command's printf-%q escaping; we avoid exec because Claude Code
-    # sends compound commands (cd /path && env VAR=val /path/to/binary).
+    # FD 4 are closed for the child so it inherits neither. The command is a
+    # shell-command line (serialize_command delivers it unescaped), so `eval`
+    # interprets the compound `cd /path && env VAR=val /path/to/binary` that
+    # Claude Code sends; we avoid exec because exec can't run a compound command.
     eval "$_cmd" <&4 3<&- 4<&- &
     CHILD=$!
     echo "$CHILD" > "$CHILD_FILE"

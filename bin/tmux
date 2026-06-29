@@ -180,18 +180,17 @@ refocus_main() {
     zellij action move-focus left 2>/dev/null || true
 }
 
-# Serialize a bash array into a single string preserving argument boundaries.
-# Each element is printf-%q escaped so the wrapper can eval it safely.
+# Emit the command words as a single shell-command line for the wrapper to run.
+# tmux's split-window/new-window/respawn-pane treat the words after `--` as a
+# shell-command (run via the shell), and Claude Code passes the whole launch
+# line as ONE such argument, e.g.:
+#     cd /path && env VAR=val /path/to/claude --agent-name X ...
+# So we join the words with spaces and let the wrapper's `eval` interpret them.
+# We must NOT printf-%q escape: that turns the line into a single un-runnable
+# word (the shell tries to exec a file literally named "cd /path && env ..."),
+# which fails with exit 127 and the pane dies instantly.
 serialize_command() {
-    local result=""
-    local arg
-    for arg in "$@"; do
-        if [ -n "$result" ]; then
-            result="$result "
-        fi
-        result="$result$(printf '%q' "$arg")"
-    done
-    echo "$result"
+    printf '%s\n' "$*"
 }
 
 # ---------------------------------------------------------------------------
