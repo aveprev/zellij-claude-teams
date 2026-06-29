@@ -92,6 +92,7 @@ command find "$ZELLIJ_TMUX_SHIM_STATE" -maxdepth 1 -name '*.pid' 2>/dev/null | w
               "$ZELLIJ_TMUX_SHIM_STATE/${_key}.ready" \
               "$ZELLIJ_TMUX_SHIM_STATE/${_key}.cmd" \
               "$ZELLIJ_TMUX_SHIM_STATE/${_key}.named" \
+              "$ZELLIJ_TMUX_SHIM_STATE/${_key}.child" \
               "$ZELLIJ_TMUX_SHIM_STATE/${_key}.group"
     fi
 done

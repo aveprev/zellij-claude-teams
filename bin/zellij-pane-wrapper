@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 # zellij-pane-wrapper: Runs inside each spawned zellij pane.
-# Receives a synthetic pane ID as $1, registers state, waits for a
-# command on a FIFO, then execs that command.
+# Receives a synthetic pane ID as $1, registers state, then supervises a
+# sequence of commands delivered over a persistent FIFO.
 #
 # Usage (called by the shim, not directly):
 #   zellij-pane-wrapper <state_dir> <shim_dir> %N
 #
 # Note: args are passed explicitly because zellij new-pane does NOT
 # inherit the calling shell's environment variables.
+#
+# Lifecycle: modern Claude Code launches an agent pane by first creating an
+# idle placeholder (`split-window -- cat`) and then replacing it with the real
+# command via `respawn-pane -k -t %N -- <cmd>`. To support that, the FIFO is
+# kept open for the life of the pane and each command we read REPLACES the
+# currently-running child (tmux respawn-pane -k semantics).
 
 set -euo pipefail
 
@@ -64,60 +70,119 @@ cleanup() {
     rm -f "${STATE_DIR}/${PANE_KEY}.ready"
     rm -f "${STATE_DIR}/${PANE_KEY}.group"
     rm -f "${STATE_DIR}/${PANE_KEY}.named"
+    rm -f "${STATE_DIR}/${PANE_KEY}.child"
 }
 trap cleanup EXIT
 
 # Signal readiness — the shim's split-window handler polls for this
 touch "${STATE_DIR}/${PANE_KEY}.ready"
 
-# Read the command from the FIFO.
-# Uses a background cat + wait with timeout to avoid blocking forever
-# if the shim crashes before delivering the command.
-COMMAND=""
-cat "$FIFO_PATH" > "${STATE_DIR}/${PANE_KEY}.cmd" &
-CAT_PID=$!
-WAIT_SECS=0
-while kill -0 "$CAT_PID" 2>/dev/null; do
-    sleep 1
-    WAIT_SECS=$((WAIT_SECS + 1))
-    if [ "$WAIT_SECS" -ge 300 ]; then
-        # 5 minutes with no command — assume the shim died
-        kill "$CAT_PID" 2>/dev/null || true
-        echo "zellij-pane-wrapper: timed out waiting for command" >&2
-        exit 1
+# ---------------------------------------------------------------------------
+# Command supervisor
+# ---------------------------------------------------------------------------
+# Open the FIFO read-write on FD 3 and hold it open for the life of the pane.
+# Opening read-write never blocks on a missing writer, and keeping a writer
+# reference alive means reads never hit EOF when the shim closes its end
+# between commands.
+exec 3<>"$FIFO_PATH" || {
+    echo "zellij-pane-wrapper: failed to open command FIFO" >&2
+    exit 1
+}
+
+# Relax errexit for the supervisor loop: read timeouts return non-zero,
+# kill -0 on a dead PID returns non-zero, and arithmetic yielding 0 would all
+# trip `set -e`. The setup above keeps its strict error handling.
+set +e
+
+CHILD=""
+CHILD_FILE="${STATE_DIR}/${PANE_KEY}.child"
+NAMED_FILE="${STATE_DIR}/${PANE_KEY}.named"
+
+# Kill the current child (if any) and reap it. Used before launching a
+# replacement command, mirroring `respawn-pane -k`.
+kill_child() {
+    if [ -n "$CHILD" ] && kill -0 "$CHILD" 2>/dev/null; then
+        kill -TERM "$CHILD" 2>/dev/null
+        _i=0
+        while [ "$_i" -lt 20 ] && kill -0 "$CHILD" 2>/dev/null; do
+            sleep 0.1 2>/dev/null || sleep 1
+            _i=$((_i + 1))
+        done
+        kill -KILL "$CHILD" 2>/dev/null
+        wait "$CHILD" 2>/dev/null
+    fi
+    CHILD=""
+    rm -f "$CHILD_FILE"
+}
+
+# Launch a command as the pane's child process.
+start_command() {
+    _cmd="$1"
+
+    # Extract the agent name and lock the pane title via zellij rename-pane.
+    # The new pane still has focus here (split-window leaves it focused and the
+    # subsequent respawn-pane does not move focus), so rename-pane targets it.
+    # Locking the title makes Claude Code's continuous title resets no-ops.
+    if [[ "$_cmd" =~ --agent-name[[:space:]]+([^[:space:]]+) ]]; then
+        _agent_name="${BASH_REMATCH[1]}"
+        echo "[wrapper] renaming pane to '${_agent_name}' (zellij_pane=${ZELLIJ_PANE_ID:-?})" >> "${STATE_DIR}/shim.log" 2>/dev/null || true
+        zellij action rename-pane "$_agent_name" >/dev/null 2>>"${STATE_DIR}/shim.log" || true
+    fi
+
+    # Run the command in the background so this loop can keep watching the FIFO
+    # for a replacement. Because job control is disabled in non-interactive
+    # shells, the child stays in this wrapper's process group — the foreground
+    # group of the pane's PTY — so interactive programs (claude) keep TTY
+    # access. FD 3 (the FIFO) is closed for the child so it never holds the
+    # command channel open. eval preserves serialize_command's printf-%q
+    # escaping; we avoid exec because Claude Code sends compound commands
+    # (cd /path && env VAR=val /path/to/binary).
+    eval "$_cmd" 3<&- &
+    CHILD=$!
+    echo "$CHILD" > "$CHILD_FILE"
+
+    # Signal that naming is done — the shim waits for this before returning.
+    touch "$NAMED_FILE"
+}
+
+# Wait up to ~5 minutes for the first command before giving up (the shim may
+# have crashed before delivering anything). Once a child is running we wait
+# indefinitely — the agent decides its own lifetime.
+IDLE=0
+IDLE_LIMIT=300
+
+while true; do
+    # If a child was running but has exited on its own, and nothing new is
+    # queued, the pane's work is done — exit so zellij closes the pane
+    # (--close-on-exit).
+    if [ -n "$CHILD" ] && ! kill -0 "$CHILD" 2>/dev/null; then
+        wait "$CHILD" 2>/dev/null
+        CHILD=""
+        rm -f "$CHILD_FILE"
+        break
+    fi
+
+    # Poll the FIFO for a (replacement) command with a 1s timeout.
+    if IFS= read -r -t 1 NEW_COMMAND <&3; then
+        [ -z "$NEW_COMMAND" ] && continue
+        IDLE=0
+        kill_child
+        start_command "$NEW_COMMAND"
+    else
+        # read returned non-zero: >128 means timeout, anything else is an
+        # unexpected EOF/error (shouldn't happen while we hold the write end).
+        if [ "$?" -gt 128 ]; then
+            if [ -z "$CHILD" ]; then
+                IDLE=$((IDLE + 1))
+                if [ "$IDLE" -ge "$IDLE_LIMIT" ]; then
+                    echo "zellij-pane-wrapper: timed out waiting for command" >&2
+                    break
+                fi
+            fi
+        else
+            sleep 1
+        fi
     fi
 done
-COMMAND=$(cat "${STATE_DIR}/${PANE_KEY}.cmd" 2>/dev/null)
-rm -f "${STATE_DIR}/${PANE_KEY}.cmd"
 
-# Remove the FIFO — it's single-use
-rm -f "$FIFO_PATH"
-
-if [ -z "$COMMAND" ]; then
-    echo "zellij-pane-wrapper: empty command received" >&2
-    exit 1
-fi
-
-# Extract agent name and lock the pane title via zellij rename-pane.
-# At this point THIS pane has focus (split-window intentionally leaves focus on
-# the new pane). rename-pane operates on the focused pane AND locks the title,
-# so Claude Code's continuous terminal title resets are permanently ignored.
-AGENT_NAME=""
-if [[ "$COMMAND" =~ --agent-name[[:space:]]+([^[:space:]]+) ]]; then
-    AGENT_NAME="${BASH_REMATCH[1]}"
-    echo "[wrapper] renaming pane to '${AGENT_NAME}' (zellij_pane=${ZELLIJ_PANE_ID:-?})" >> "${STATE_DIR}/shim.log" 2>/dev/null || true
-    zellij action rename-pane "$AGENT_NAME" 2>>"${STATE_DIR}/shim.log" || true
-    echo "[wrapper] rename-pane exit code: $?" >> "${STATE_DIR}/shim.log" 2>/dev/null || true
-fi
-
-# Signal that naming is done — the shim's send-keys handler waits for this
-# before returning focus to the main pane.
-touch "${STATE_DIR}/${PANE_KEY}.named"
-
-# Execute the command.
-# eval preserves printf-%q escaping from serialize_command in the shim.
-# Note: we do NOT use exec here because Claude Code sends compound commands
-# (cd /path && env VAR=val /path/to/binary) and exec only applies to simple
-# commands. The wrapper shell stays as parent — this is fine because the EXIT
-# trap will fire and clean up state files when the command finishes.
-eval "$COMMAND"
+exec 3<&- 2>/dev/null || true
