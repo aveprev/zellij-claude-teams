@@ -89,6 +89,14 @@ exec 3<>"$FIFO_PATH" || {
     exit 1
 }
 
+# Save the pane's real stdin (the PTY) on FD 4. We run each command as a
+# background job so this loop can keep watching the FIFO; but in a shell with
+# job control off, a background job's stdin is silently reassigned to
+# /dev/null. That would feed the agent (and even the `cat` placeholder)
+# end-of-file instead of the keyboard, so we explicitly restore stdin from FD 4
+# when launching the child.
+exec 4<&0
+
 # Relax errexit for the supervisor loop: read timeouts return non-zero,
 # kill -0 on a dead PID returns non-zero, and arithmetic yielding 0 would all
 # trip `set -e`. The setup above keeps its strict error handling.
@@ -133,11 +141,12 @@ start_command() {
     # for a replacement. Because job control is disabled in non-interactive
     # shells, the child stays in this wrapper's process group — the foreground
     # group of the pane's PTY — so interactive programs (claude) keep TTY
-    # access. FD 3 (the FIFO) is closed for the child so it never holds the
-    # command channel open. eval preserves serialize_command's printf-%q
-    # escaping; we avoid exec because Claude Code sends compound commands
-    # (cd /path && env VAR=val /path/to/binary).
-    eval "$_cmd" 3<&- &
+    # access. stdin is restored from FD 4 (the real PTY) so it isn't the
+    # /dev/null that backgrounding would otherwise assign; FD 3 (the FIFO) and
+    # FD 4 are closed for the child so it inherits neither. eval preserves
+    # serialize_command's printf-%q escaping; we avoid exec because Claude Code
+    # sends compound commands (cd /path && env VAR=val /path/to/binary).
+    eval "$_cmd" <&4 3<&- 4<&- &
     CHILD=$!
     echo "$CHILD" > "$CHILD_FILE"
 
