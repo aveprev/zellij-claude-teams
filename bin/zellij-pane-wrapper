@@ -127,14 +127,20 @@ kill_child() {
 start_command() {
     _cmd="$1"
 
-    # Extract the agent name and lock the pane title via zellij rename-pane.
-    # The new pane still has focus here (split-window leaves it focused and the
-    # subsequent respawn-pane does not move focus), so rename-pane targets it.
+    # Extract the agent name and lock the pane title. We target this wrapper's
+    # own pane explicitly by id (rename-pane -p) rather than relying on focus:
+    # the shim restores the user's tab after placing the pane, so focus is not
+    # guaranteed to be on us by the time the command arrives. Targeting by id
+    # also avoids mislabeling when concurrent spawns move focus between panes.
     # Locking the title makes Claude Code's continuous title resets no-ops.
     if [[ "$_cmd" =~ --agent-name[[:space:]]+([^[:space:]]+) ]]; then
         _agent_name="${BASH_REMATCH[1]}"
         echo "[wrapper] renaming pane to '${_agent_name}' (zellij_pane=${ZELLIJ_PANE_ID:-?})" >> "${STATE_DIR}/shim.log" 2>/dev/null || true
-        zellij action rename-pane "$_agent_name" >/dev/null 2>>"${STATE_DIR}/shim.log" || true
+        if [ -n "${ZELLIJ_PANE_ID:-}" ] && [ "${ZELLIJ_PANE_ID}" != "unknown" ]; then
+            zellij action rename-pane -p "$ZELLIJ_PANE_ID" "$_agent_name" >/dev/null 2>>"${STATE_DIR}/shim.log" || true
+        else
+            zellij action rename-pane "$_agent_name" >/dev/null 2>>"${STATE_DIR}/shim.log" || true
+        fi
     fi
 
     # Run the command in the background so this loop can keep watching the FIFO

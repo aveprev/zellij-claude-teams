@@ -113,11 +113,11 @@ bash install.sh --uninstall
 
 ## Features
 
-- **Pane naming** — each agent pane is titled with its role (researcher, implementer, etc.) via `zellij action rename-pane`, which locks the title so Claude Code's TUI can't override it
+- **Pane naming** — each agent pane is titled with its role (researcher, implementer, etc.) via `zellij action rename-pane -p <pane-id>` (targeted by id, so it works regardless of which pane or tab is focused), which locks the title so Claude Code's TUI can't override it
 - **Stacked layout** — the first agent splits right of the main pane; each additional agent is folded into a single Zellij *stack* on the right (collapsed to a one-row title bar, expanded when focused). Stacking sidesteps Zellij's minimum pane height, so large teams (8+) spawn reliably instead of failing once the column runs out of room
 - **Session isolation** — state is scoped by `ZELLIJ_SESSION_NAME`, so multiple Zellij sessions don't collide
 - **Tab isolation** — agent teams in different tabs within the same session are tracked independently via `.group` files
-- **Focus management** — focus chains through agents during creation, with `move-focus right` ensuring correct placement even if you click back to main between spawns
+- **Tab pinning** — teammate panes are always created on the Claude Code tab, even if you've navigated to another tab. Before each split the shim focuses an anchor pane on the Claude tab (`focus-pane-id`), then restores your previous tab (`go-to-tab-by-id`) once the pane is placed — so spawning a teammate doesn't drag your view away
 
 ## How It Works
 

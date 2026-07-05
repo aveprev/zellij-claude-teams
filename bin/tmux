@@ -125,6 +125,14 @@ create_lock_release() {
     rmdir "${STATE_DIR}/create.lock" 2>/dev/null || true
 }
 
+# Print the stable id of the currently active (focused) zellij tab, or nothing
+# if it can't be determined. Used to remember the user's tab so we can return
+# them to it after borrowing focus to place a pane on the Claude Code tab.
+get_active_tab_id() {
+    zellij action current-tab-info 2>/dev/null \
+        | awk -F': ' '$1 == "id" { print $2; exit }'
+}
+
 # Snapshot current environment to a file for child panes to restore.
 # Called once per session; subsequent calls are no-ops.
 # Uses `export -p` (POSIX) instead of `env -0` (GNU extension).
@@ -342,11 +350,16 @@ split-window)
     # Tag this pane with the caller's zellij pane ID (for tab-scoped stacking)
     echo "${ZELLIJ_PANE_ID:-0}" > "${STATE_DIR}/${PANE_KEY}.group"
 
-    # If other living agents exist in this tab, override direction to "down"
-    # so agents stack vertically on the right instead of splitting horizontally.
-    # Focus chains through agents (no intermediate refocus to main), so the
-    # 2nd+ pane is created relative to the previous agent — "down" gives
-    # a clean [main | agent1 / agent2 / agent3] layout.
+    # Scan the living agents in this tab to decide two things:
+    #   1. Direction: if any agent already exists, split "down" so agents stack
+    #      vertically on the right instead of splitting the main pane again.
+    #   2. Anchor: the zellij pane we focus before creating (see focus-pane-id
+    #      below). We pick the most-recently-created live agent (highest pane
+    #      key) so the split divides the tall expanded member of the stack. With
+    #      no living agent, we anchor to the caller's own pane (ZELLIJ_PANE_ID)
+    #      so the first agent splits right of the main pane on the correct tab.
+    anchor_pane_id="${ZELLIJ_PANE_ID:-0}"
+    _best_key=-1
     for _gf in "${STATE_DIR}"/*.group; do
         [ -f "$_gf" ] || continue
         _gk="${_gf##*/}"; _gk="${_gk%.group}"
@@ -355,9 +368,13 @@ split-window)
         _pp="${STATE_DIR}/${_gk}.pid"
         [ -f "$_pp" ] || continue
         _pd=$(cat "$_pp" 2>/dev/null)
-        if [ -n "$_pd" ] && kill -0 "$_pd" 2>/dev/null; then
-            sw_direction="down"
-            break
+        [ -n "$_pd" ] && kill -0 "$_pd" 2>/dev/null || continue
+        sw_direction="down"
+        # Track the highest-keyed (newest) live agent's zellij pane id.
+        _zid=$(cat "${STATE_DIR}/${_gk}.zellij_id" 2>/dev/null)
+        if [ -n "$_zid" ] && [ "$_zid" != "unknown" ] && [ "$_gk" -gt "$_best_key" ]; then
+            _best_key="$_gk"
+            anchor_pane_id="$_zid"
         fi
     done
 
@@ -369,6 +386,15 @@ split-window)
     # Serialize the rest of pane creation: concurrent spawns must not interleave
     # on the shared focus/stack state (see create_lock_acquire).
     create_lock_acquire || { log_debug "split-window: create lock failed"; exit 1; }
+
+    # Pin creation to the Claude Code tab. `zellij new-pane` targets the focused
+    # tab, so if the user has navigated elsewhere the pane would be created on
+    # the wrong tab. Remember the user's current tab, then focus an anchor pane
+    # on the Claude tab (the newest live agent, or the caller's own pane for the
+    # first agent) — this selects the right tab and gives the -d split a tall
+    # pane to divide. The user's tab is restored once the pane is placed.
+    orig_tab_id=$(get_active_tab_id)
+    zellij action focus-pane-id "$anchor_pane_id" 2>/dev/null || true
 
     # Collapse existing agents in this tab into a single zellij stack. Stacked
     # panes shrink to a one-row title bar each except the focused/expanded one,
@@ -397,6 +423,13 @@ split-window)
     # next agent sees one tall expanded pane to split. The wrapper writes
     # .zellij_id and .pid before .ready, so the new pane is already included.
     stack_agent_panes
+
+    # Return the user to the tab they were on before we borrowed focus. Pane
+    # naming no longer depends on focus (the wrapper renames its own pane by id),
+    # so it is safe to move focus away now.
+    if [ -n "$orig_tab_id" ]; then
+        zellij action go-to-tab-by-id "$orig_tab_id" 2>/dev/null || true
+    fi
 
     create_lock_release
 
