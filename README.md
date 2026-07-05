@@ -114,7 +114,7 @@ bash install.sh --uninstall
 ## Features
 
 - **Pane naming** — each agent pane is titled with its role (researcher, implementer, etc.) via `zellij action rename-pane`, which locks the title so Claude Code's TUI can't override it
-- **Vertical layout** — the first agent splits right; subsequent agents stack below it automatically
+- **Stacked layout** — the first agent splits right of the main pane; each additional agent is folded into a single Zellij *stack* on the right (collapsed to a one-row title bar, expanded when focused). Stacking sidesteps Zellij's minimum pane height, so large teams (8+) spawn reliably instead of failing once the column runs out of room
 - **Session isolation** — state is scoped by `ZELLIJ_SESSION_NAME`, so multiple Zellij sessions don't collide
 - **Tab isolation** — agent teams in different tabs within the same session are tracked independently via `.group` files
 - **Focus management** — focus chains through agents during creation, with `move-focus right` ensuring correct placement even if you click back to main between spawns
@@ -160,6 +160,7 @@ Zellij's `new-pane` does **not** inherit the parent shell's environment (unlike 
 ### Concurrency
 
 - **Pane ID allocation** uses `mkdir`-based locking (portable; macOS lacks `flock`)
+- **Pane creation** is serialized by a second `mkdir` lock (`create.lock`). Claude Code launches teammates in parallel, and each spawn stacks the existing agents, splits, then re-stacks — steps that share the session's focus/stack state and must not interleave. Without the lock, concurrent spawns race and some panes fail to be created
 - Stale lock detection via PID-in-lockdir: if the locker process is dead, the lock is reclaimed
 - Each pane's state is in separate files, so most operations are naturally isolated
 
@@ -189,6 +190,7 @@ cat "${ZELLIJ_TMUX_SHIM_STATE}/shim.log"
 ## Known Limitations
 
 - **No pane resizing** — Zellij manages layout automatically; tmux layout commands are no-ops
+- **Large teams share one stack** — there's no hard cap on teammates, but agents collapse into a single Zellij stack, so only the focused agent is shown expanded at a time (navigate the stack with your Zellij keybindings)
 - **Fragile to Claude Code updates** — new tmux commands added upstream may need shim updates. Debug logging captures unhandled commands for diagnosis.
 
 ## Compatibility

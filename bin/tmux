@@ -89,6 +89,42 @@ alloc_pane_id() {
     echo "%${current}"
 }
 
+# Serialize the pane-creation critical section across concurrent agent spawns.
+# Claude Code launches teammates in parallel, so several split-window calls race
+# here; they share one zellij session's focus/stack state, so without a lock they
+# interleave and some panes fail to be created. mkdir is the lock primitive
+# (portable; macOS lacks flock), mirroring alloc_pane_id's stale-lock handling.
+create_lock_acquire() {
+    local lockdir="${STATE_DIR}/create.lock"
+    local attempts=0
+    while ! mkdir "$lockdir" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        # Stale lock detection: reclaim if the holder PID is gone.
+        if [ "$attempts" -ge 50 ] && [ -d "$lockdir" ]; then
+            local lock_pid
+            lock_pid=$(cat "$lockdir/pid" 2>/dev/null || echo "")
+            if [ -z "$lock_pid" ] || ! kill -0 "$lock_pid" 2>/dev/null; then
+                log_debug "WARNING: removing stale create lock (PID '${lock_pid}' dead)"
+                rm -f "$lockdir/pid"
+                rmdir "$lockdir" 2>/dev/null || true
+            fi
+        fi
+        # ~10 min ceiling: the critical section includes wait_for_ready, and a
+        # dozen or more agents may be queued behind us during a big team spawn.
+        if [ "$attempts" -gt 6000 ]; then
+            log_debug "ERROR: could not acquire create lock"
+            return 1
+        fi
+        sleep 0.1 2>/dev/null || sleep 1
+    done
+    echo "$$" > "$lockdir/pid"
+}
+
+create_lock_release() {
+    rm -f "${STATE_DIR}/create.lock/pid"
+    rmdir "${STATE_DIR}/create.lock" 2>/dev/null || true
+}
+
 # Snapshot current environment to a file for child panes to restore.
 # Called once per session; subsequent calls are no-ops.
 # Uses `export -p` (POSIX) instead of `env -0` (GNU extension).
@@ -330,6 +366,18 @@ split-window)
     # Snapshot env so the wrapper can restore it in the new pane
     snapshot_env
 
+    # Serialize the rest of pane creation: concurrent spawns must not interleave
+    # on the shared focus/stack state (see create_lock_acquire).
+    create_lock_acquire || { log_debug "split-window: create lock failed"; exit 1; }
+
+    # Collapse existing agents in this tab into a single zellij stack. Stacked
+    # panes shrink to a one-row title bar each except the focused/expanded one,
+    # which keeps full height — so the `-d down` split below has room to land.
+    # Without this, splitting an already-tiny tiled pane fails once ~4 agents
+    # exist (zellij enforces a minimum pane height) — the failure Claude Code
+    # surfaces as "Failed to create teammate pane".
+    stack_agent_panes
+
     # Build zellij new-pane command
     zellij_args=(action new-pane --close-on-exit -d "$sw_direction")
 
@@ -341,8 +389,16 @@ split-window)
     # Wait for wrapper to signal readiness (creates .ready sentinel)
     if ! wait_for_ready "$PANE_KEY"; then
         log_debug "split-window: pane ${NEW_PANE_ID} failed to become ready"
+        create_lock_release
         exit 1
     fi
+
+    # Fold the just-created pane into the stack with the existing agents so the
+    # next agent sees one tall expanded pane to split. The wrapper writes
+    # .zellij_id and .pid before .ready, so the new pane is already included.
+    stack_agent_panes
+
+    create_lock_release
 
     log_debug "split-window: pane ${NEW_PANE_ID} ready"
 
