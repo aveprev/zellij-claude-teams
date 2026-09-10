@@ -3,3 +3,4 @@ state/
 parent.env
 *.cmd
 next_id.lock/
+.DS_Store
