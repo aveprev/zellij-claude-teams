@@ -8,11 +8,82 @@ if [ -z "$ZELLIJ" ]; then
     return 1 2>/dev/null || exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# PATH guard
+# ---------------------------------------------------------------------------
+# Sourcing this file once is not enough. Tools that rewrite PATH wholesale
+# (sdkman's `sdk use`, mise hook-env, direnv, nested login shells) can demote
+# or drop the shim entry mid-session. Anything launched afterwards resolves the
+# real tmux, which fails against our synthetic $TMUX socket — Claude Code then
+# reports "Could not determine current tmux pane/window" and no teammate pane
+# is ever created. Re-assert position 1 before every prompt so the next `claude`
+# launch always inherits a correct PATH.
+__zellij_tmux_shim_ensure_path() {
+    [ -n "${ZELLIJ_TMUX_SHIM_ACTIVE:-}" ] || return 0
+    [ -n "${ZELLIJ_TMUX_SHIM_DIR:-}" ] || return 0
+
+    local _bin="${ZELLIJ_TMUX_SHIM_DIR}/bin"
+    # Already in front: the common case, so do no work.
+    case "$PATH" in
+        "$_bin") return 0 ;;
+        "$_bin":*) return 0 ;;
+    esac
+
+    # Drop every existing copy, then put ours back in front. The colon padding
+    # lets the first and last entries match the same ":dir:" pattern as the
+    # middle ones; the loop covers adjacent duplicates, which a single global
+    # substitution would leave behind.
+    local _rest=":${PATH}:"
+    while :; do
+        case "$_rest" in
+            *":${_bin}:"*) _rest="${_rest//:${_bin}:/:}" ;;
+            *) break ;;
+        esac
+    done
+    _rest="${_rest#:}"
+    _rest="${_rest%:}"
+
+    PATH="${_bin}${_rest:+:${_rest}}"
+    export PATH
+}
+
+# Register the guard with the shell's pre-prompt hook. Idempotent: re-sourcing
+# this file (or a nested shell inheriting the registration) must not stack it.
+__zellij_tmux_shim_install_path_hook() {
+    if [ -n "${ZSH_VERSION:-}" ]; then
+        typeset -ga precmd_functions
+        case " ${precmd_functions[*]} " in
+            *" __zellij_tmux_shim_ensure_path "*) ;;
+            *) precmd_functions+=(__zellij_tmux_shim_ensure_path) ;;
+        esac
+    elif [ -n "${BASH_VERSION:-}" ]; then
+        # bash 5.1+ allows PROMPT_COMMAND to be an array; handle both forms.
+        case "$(declare -p PROMPT_COMMAND 2>/dev/null)" in
+            "declare -a"*)
+                case " ${PROMPT_COMMAND[*]} " in
+                    *" __zellij_tmux_shim_ensure_path "*) ;;
+                    *) PROMPT_COMMAND+=(__zellij_tmux_shim_ensure_path) ;;
+                esac
+                ;;
+            *)
+                case "${PROMPT_COMMAND:-}" in
+                    *__zellij_tmux_shim_ensure_path*) ;;
+                    "") PROMPT_COMMAND="__zellij_tmux_shim_ensure_path" ;;
+                    *) PROMPT_COMMAND="__zellij_tmux_shim_ensure_path; ${PROMPT_COMMAND}" ;;
+                esac
+                ;;
+        esac
+    fi
+}
+
 # Guard: don't double-activate — but always re-ensure PATH priority.
 # Child shells inherit ZELLIJ_TMUX_SHIM_ACTIVE but rebuild PATH from
 # shell config, pushing the shim behind other entries (brew, cargo, etc.).
+# The guard above dedupes, so re-sourcing never stacks copies of the entry.
 if [ -n "$ZELLIJ_TMUX_SHIM_ACTIVE" ]; then
-    export PATH="${ZELLIJ_TMUX_SHIM_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/zellij-tmux-shim}/bin:${PATH}"
+    export ZELLIJ_TMUX_SHIM_DIR="${ZELLIJ_TMUX_SHIM_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/zellij-tmux-shim}"
+    __zellij_tmux_shim_ensure_path
+    __zellij_tmux_shim_install_path_hook
     return 0 2>/dev/null || exit 0
 fi
 
@@ -109,3 +180,6 @@ rm -f "$ZELLIJ_TMUX_SHIM_STATE/parent.env"
 rm -rf "$ZELLIJ_TMUX_SHIM_STATE/next_id.lock"
 
 export ZELLIJ_TMUX_SHIM_ACTIVE=1
+
+# Keep the shim in front for the rest of this shell's life
+__zellij_tmux_shim_install_path_hook

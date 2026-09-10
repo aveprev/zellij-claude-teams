@@ -115,6 +115,7 @@ bash install.sh --uninstall
 
 - **Pane naming** — each agent pane is titled with its role (researcher, implementer, etc.) via `zellij action rename-pane -p <pane-id>` (targeted by id, so it works regardless of which pane or tab is focused), which locks the title so Claude Code's TUI can't override it
 - **Stacked layout** — the first agent splits right of the main pane; each additional agent is folded into a single Zellij *stack* on the right (collapsed to a one-row title bar, expanded when focused). Stacking sidesteps Zellij's minimum pane height, so large teams (8+) spawn reliably instead of failing once the column runs out of room
+- **PATH guard** — the shim only works if its `bin/` is the *first* `tmux` on `PATH`. Sourcing `activate.*` once isn't enough: `sdk use`, `mise hook-env`, `direnv` and nested login shells rewrite `PATH` wholesale and can demote the entry. A pre-prompt hook (`fish_prompt` / `precmd_functions` / `PROMPT_COMMAND`) re-asserts position 1 before every command, deduping any stale copies
 - **Session isolation** — state is scoped by `ZELLIJ_SESSION_NAME`, so multiple Zellij sessions don't collide
 - **Tab isolation** — agent teams in different tabs within the same session are tracked independently via `.group` files
 - **Tab pinning** — teammate panes are always created on the Claude Code tab, even if you've navigated to another tab. Before each split the shim focuses an anchor pane on the Claude tab (`focus-pane-id`), then restores your previous tab (`go-to-tab-by-id`) once the pane is placed — so spawning a teammate doesn't drag your view away
@@ -174,6 +175,22 @@ Zellij's `new-pane` does **not** inherit the parent shell's environment (unlike 
 ### Agent panes steal focus
 
 Focus chains through agents during creation for correct layout placement. After all agents spawn, click the main pane to return keyboard focus. If you're on an older version, update to the latest.
+
+### Teammates fail with "Could not determine current tmux pane/window"
+
+Real `tmux` is answering instead of the shim. Claude Code takes the socket path from the synthetic `$TMUX` the shim exports, so the real binary fails with `error connecting to zellij-shim:/tmp/zellij-shim` and every teammate spawn dies. Check the resolution order in the pane:
+
+```bash
+command -v tmux   # must print .../zellij-tmux-shim/bin/tmux
+```
+
+If it prints `/opt/homebrew/bin/tmux` (or similar), something rewrote `PATH` after activation. The pre-prompt PATH guard repairs this before the next command, but a Claude Code session already running keeps the environment it was launched with — restart it:
+
+```bash
+source "${XDG_DATA_HOME:-$HOME/.local/share}/zellij-tmux-shim/activate.fish"  # or activate.sh
+command -v tmux
+claude ...
+```
 
 ### Environment variables missing in panes
 

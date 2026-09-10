@@ -22,6 +22,10 @@ if set -q ZELLIJ_TMUX_SHIM_ORIG_PATH; and test -n "$ZELLIJ_TMUX_SHIM_ORIG_PATH"
     set -gx PATH (string split : $ZELLIJ_TMUX_SHIM_ORIG_PATH)
 end
 
+# Drop the pre-prompt PATH guard (erasing the function also removes its
+# fish_prompt event handler)
+functions -q __zellij_tmux_shim_ensure_path; and functions --erase __zellij_tmux_shim_ensure_path
+
 # Unset all shim env vars
 set -e TMUX
 set -e TMUX_PANE

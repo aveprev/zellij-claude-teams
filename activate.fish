@@ -15,17 +15,47 @@ else
     set _xdg_data_home $HOME/.local/share
 end
 
+# ---------------------------------------------------------------------------
+# PATH guard
+# ---------------------------------------------------------------------------
+# Sourcing this file once is not enough. Tools that rewrite PATH wholesale
+# (sdkman's `sdk use`, mise hook-env, direnv, nested login shells) can demote
+# or drop the shim entry mid-session. Anything launched afterwards resolves the
+# real tmux, which fails against our synthetic $TMUX socket — Claude Code then
+# reports "Could not determine current tmux pane/window" and no teammate pane
+# is ever created. Re-assert position 1 before every prompt so the next `claude`
+# launch always inherits a correct PATH.
+function __zellij_tmux_shim_ensure_path --on-event fish_prompt --description 'Keep zellij-tmux-shim first on PATH'
+    if not set -q ZELLIJ_TMUX_SHIM_ACTIVE; or test -z "$ZELLIJ_TMUX_SHIM_ACTIVE"
+        return 0
+    end
+    if not set -q ZELLIJ_TMUX_SHIM_DIR; or test -z "$ZELLIJ_TMUX_SHIM_DIR"
+        return 0
+    end
+    set -l _bin $ZELLIJ_TMUX_SHIM_DIR/bin
+    if test (count $PATH) -gt 0; and test "$PATH[1]" = "$_bin"
+        return 0
+    end
+    # Drop every existing copy (literal compare, so a glob character in the
+    # path can't match the wrong entry), then put ours back in front.
+    set -l _rest
+    for _entry in $PATH
+        if test "$_entry" != "$_bin"
+            set -a _rest $_entry
+        end
+    end
+    set -gx PATH $_bin $_rest
+end
+
 # Guard: don't double-activate — but always re-ensure PATH priority.
 # Child shells inherit ZELLIJ_TMUX_SHIM_ACTIVE but rebuild PATH from
 # shell config, pushing the shim behind other entries (brew, cargo, etc.).
+# The hook above dedupes, so re-sourcing never stacks copies of the entry.
 if set -q ZELLIJ_TMUX_SHIM_ACTIVE; and test -n "$ZELLIJ_TMUX_SHIM_ACTIVE"
-    set -l _existing_dir
-    if set -q ZELLIJ_TMUX_SHIM_DIR; and test -n "$ZELLIJ_TMUX_SHIM_DIR"
-        set _existing_dir $ZELLIJ_TMUX_SHIM_DIR
-    else
-        set _existing_dir $_xdg_data_home/zellij-tmux-shim
+    if not set -q ZELLIJ_TMUX_SHIM_DIR; or test -z "$ZELLIJ_TMUX_SHIM_DIR"
+        set -gx ZELLIJ_TMUX_SHIM_DIR $_xdg_data_home/zellij-tmux-shim
     end
-    set -gx PATH $_existing_dir/bin $PATH
+    __zellij_tmux_shim_ensure_path
     return 0
 end
 

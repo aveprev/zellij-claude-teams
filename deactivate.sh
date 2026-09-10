@@ -24,6 +24,11 @@ if [ -n "$ZELLIJ_TMUX_SHIM_ORIG_PATH" ]; then
     export PATH="$ZELLIJ_TMUX_SHIM_ORIG_PATH"
 fi
 
+# The pre-prompt PATH guard stays defined on purpose: it is still referenced by
+# PROMPT_COMMAND / precmd_functions, and unsetting it there would make every
+# prompt report a missing command. It no-ops as soon as
+# ZELLIJ_TMUX_SHIM_ACTIVE is gone (below), and re-activating reuses it.
+
 # Unset all shim env vars
 unset TMUX
 unset TMUX_PANE
