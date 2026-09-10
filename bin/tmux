@@ -237,6 +237,102 @@ serialize_command() {
     printf '%s\n' "$*"
 }
 
+# Create a teammate pane on the Claude Code tab. Shared by split-window and
+# new-window so there is a single, correct pane-creation path.
+#   $1 = synthetic pane id (e.g. %5), already allocated by the caller
+#   $2 = fallback split direction for the FIRST agent ("right" or "down");
+#        overridden to "down" automatically once another agent exists
+#   $3 = optional pane name for `new-pane -n` (pass "" for none)
+# Tags group state, pins creation to the Claude tab, stacks the agents, and
+# restores the user's tab. Returns 0 once the pane is ready, 1 on failure.
+spawn_agent_pane() {
+    local new_pane_id="$1"
+    local direction="$2"
+    local pane_name="$3"
+    local pane_key="${new_pane_id#%}"
+
+    # Tag this pane with the caller's zellij pane ID (for tab-scoped grouping).
+    echo "${ZELLIJ_PANE_ID:-0}" > "${STATE_DIR}/${pane_key}.group"
+
+    # Scan the living agents in this tab to decide two things:
+    #   1. Direction: if any agent already exists, split "down" so agents stack
+    #      vertically on the right instead of splitting the main pane again.
+    #   2. Anchor: the zellij pane we focus before creating (see focus-pane-id
+    #      below). We pick the most-recently-created live agent (highest pane
+    #      key) so the split divides the tall expanded member of the stack. With
+    #      no living agent, we anchor to the caller's own pane (ZELLIJ_PANE_ID)
+    #      so the first agent splits relative to the main pane on the right tab.
+    local anchor_pane_id="${ZELLIJ_PANE_ID:-0}"
+    local best_key=-1
+    local _gf _gk _pp _pd _zid
+    for _gf in "${STATE_DIR}"/*.group; do
+        [ -f "$_gf" ] || continue
+        _gk="${_gf##*/}"; _gk="${_gk%.group}"
+        [ "$_gk" = "$pane_key" ] && continue
+        [ "$(cat "$_gf" 2>/dev/null)" = "${ZELLIJ_PANE_ID:-0}" ] || continue
+        _pp="${STATE_DIR}/${_gk}.pid"
+        [ -f "$_pp" ] || continue
+        _pd=$(cat "$_pp" 2>/dev/null)
+        [ -n "$_pd" ] && kill -0 "$_pd" 2>/dev/null || continue
+        direction="down"
+        # Track the highest-keyed (newest) live agent's zellij pane id.
+        _zid=$(cat "${STATE_DIR}/${_gk}.zellij_id" 2>/dev/null)
+        if [ -n "$_zid" ] && [ "$_zid" != "unknown" ] && [ "$_gk" -gt "$best_key" ]; then
+            best_key="$_gk"
+            anchor_pane_id="$_zid"
+        fi
+    done
+
+    log_debug "spawn_agent_pane: creating ${new_pane_id} direction=${direction} name='${pane_name}'"
+
+    # Snapshot env so the wrapper can restore it in the new pane.
+    snapshot_env
+
+    # Serialize the rest: concurrent spawns must not interleave on the shared
+    # focus/stack state (see create_lock_acquire).
+    create_lock_acquire || { log_debug "spawn_agent_pane: create lock failed"; return 1; }
+
+    # Pin creation to the Claude Code tab. `zellij new-pane` targets the focused
+    # tab, so if the user has navigated elsewhere the pane would land on the
+    # wrong tab. Remember the user's tab, focus the anchor pane on the Claude
+    # tab (this also gives the -d split a tall pane to divide), and restore the
+    # user's tab once the pane is placed.
+    local orig_tab_id
+    orig_tab_id=$(get_active_tab_id)
+    zellij action focus-pane-id "$anchor_pane_id" 2>/dev/null || true
+
+    # Collapse existing agents into a single stack so the -d split has room.
+    # Without this, splitting an already-tiny tiled pane fails once ~4 agents
+    # exist (zellij enforces a minimum pane height) — the failure Claude Code
+    # surfaces as "Failed to create teammate pane".
+    stack_agent_panes
+
+    local zellij_args=(action new-pane --close-on-exit -d "$direction")
+    [ -n "$pane_name" ] && zellij_args+=(-n "$pane_name")
+    # Redirect stdout/stderr — zellij prints the created pane id, which would
+    # otherwise leak into our output and corrupt the id returned via -P.
+    zellij "${zellij_args[@]}" -- "${SHIM_DIR}/bin/zellij-pane-wrapper" "$STATE_DIR" "$SHIM_DIR" "$new_pane_id" > /dev/null 2>&1 &
+
+    if ! wait_for_ready "$pane_key"; then
+        log_debug "spawn_agent_pane: pane ${new_pane_id} failed to become ready"
+        create_lock_release
+        return 1
+    fi
+
+    # Fold the just-created pane into the stack (the wrapper writes .zellij_id
+    # and .pid before .ready, so it is already included), then return the user
+    # to their tab. Naming is focus-independent (wrapper renames its own pane by
+    # id), so moving focus away here is safe.
+    stack_agent_panes
+    if [ -n "$orig_tab_id" ]; then
+        zellij action go-to-tab-by-id "$orig_tab_id" 2>/dev/null || true
+    fi
+
+    create_lock_release
+    log_debug "spawn_agent_pane: pane ${new_pane_id} ready"
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # Strip -L/-S <socket> flags (Claude Code may pass them; we ignore them)
 # ---------------------------------------------------------------------------
@@ -347,96 +443,13 @@ split-window)
     PANE_KEY="${NEW_PANE_ID#%}"
     validate_pane_key "$PANE_KEY" || { log_debug "split-window: invalid pane key"; exit 1; }
 
-    # Tag this pane with the caller's zellij pane ID (for tab-scoped stacking)
-    echo "${ZELLIJ_PANE_ID:-0}" > "${STATE_DIR}/${PANE_KEY}.group"
-
-    # Scan the living agents in this tab to decide two things:
-    #   1. Direction: if any agent already exists, split "down" so agents stack
-    #      vertically on the right instead of splitting the main pane again.
-    #   2. Anchor: the zellij pane we focus before creating (see focus-pane-id
-    #      below). We pick the most-recently-created live agent (highest pane
-    #      key) so the split divides the tall expanded member of the stack. With
-    #      no living agent, we anchor to the caller's own pane (ZELLIJ_PANE_ID)
-    #      so the first agent splits right of the main pane on the correct tab.
-    anchor_pane_id="${ZELLIJ_PANE_ID:-0}"
-    _best_key=-1
-    for _gf in "${STATE_DIR}"/*.group; do
-        [ -f "$_gf" ] || continue
-        _gk="${_gf##*/}"; _gk="${_gk%.group}"
-        [ "$_gk" = "$PANE_KEY" ] && continue
-        [ "$(cat "$_gf" 2>/dev/null)" = "${ZELLIJ_PANE_ID:-0}" ] || continue
-        _pp="${STATE_DIR}/${_gk}.pid"
-        [ -f "$_pp" ] || continue
-        _pd=$(cat "$_pp" 2>/dev/null)
-        [ -n "$_pd" ] && kill -0 "$_pd" 2>/dev/null || continue
-        sw_direction="down"
-        # Track the highest-keyed (newest) live agent's zellij pane id.
-        _zid=$(cat "${STATE_DIR}/${_gk}.zellij_id" 2>/dev/null)
-        if [ -n "$_zid" ] && [ "$_zid" != "unknown" ] && [ "$_gk" -gt "$_best_key" ]; then
-            _best_key="$_gk"
-            anchor_pane_id="$_zid"
-        fi
-    done
-
-    log_debug "split-window: creating pane ${NEW_PANE_ID} direction=${sw_direction}"
-
-    # Snapshot env so the wrapper can restore it in the new pane
-    snapshot_env
-
-    # Serialize the rest of pane creation: concurrent spawns must not interleave
-    # on the shared focus/stack state (see create_lock_acquire).
-    create_lock_acquire || { log_debug "split-window: create lock failed"; exit 1; }
-
-    # Pin creation to the Claude Code tab. `zellij new-pane` targets the focused
-    # tab, so if the user has navigated elsewhere the pane would be created on
-    # the wrong tab. Remember the user's current tab, then focus an anchor pane
-    # on the Claude tab (the newest live agent, or the caller's own pane for the
-    # first agent) — this selects the right tab and gives the -d split a tall
-    # pane to divide. The user's tab is restored once the pane is placed.
-    orig_tab_id=$(get_active_tab_id)
-    zellij action focus-pane-id "$anchor_pane_id" 2>/dev/null || true
-
-    # Collapse existing agents in this tab into a single zellij stack. Stacked
-    # panes shrink to a one-row title bar each except the focused/expanded one,
-    # which keeps full height — so the `-d down` split below has room to land.
-    # Without this, splitting an already-tiny tiled pane fails once ~4 agents
-    # exist (zellij enforces a minimum pane height) — the failure Claude Code
-    # surfaces as "Failed to create teammate pane".
-    stack_agent_panes
-
-    # Build zellij new-pane command
-    zellij_args=(action new-pane --close-on-exit -d "$sw_direction")
-
-    # Launch the wrapper in a new zellij pane.
-    # Redirect stdout/stderr — zellij prints the new pane ID (e.g. "terminal_25")
-    # which would leak into our output and corrupt the pane ID returned via -P.
-    zellij "${zellij_args[@]}" -- "${SHIM_DIR}/bin/zellij-pane-wrapper" "$STATE_DIR" "$SHIM_DIR" "$NEW_PANE_ID" > /dev/null 2>&1 &
-
-    # Wait for wrapper to signal readiness (creates .ready sentinel)
-    if ! wait_for_ready "$PANE_KEY"; then
-        log_debug "split-window: pane ${NEW_PANE_ID} failed to become ready"
-        create_lock_release
+    # Create the pane on the Claude Code tab (shared, tab-pinned + stacked path).
+    if ! spawn_agent_pane "$NEW_PANE_ID" "$sw_direction" ""; then
         exit 1
     fi
 
-    # Fold the just-created pane into the stack with the existing agents so the
-    # next agent sees one tall expanded pane to split. The wrapper writes
-    # .zellij_id and .pid before .ready, so the new pane is already included.
-    stack_agent_panes
-
-    # Return the user to the tab they were on before we borrowed focus. Pane
-    # naming no longer depends on focus (the wrapper renames its own pane by id),
-    # so it is safe to move focus away now.
-    if [ -n "$orig_tab_id" ]; then
-        zellij action go-to-tab-by-id "$orig_tab_id" 2>/dev/null || true
-    fi
-
-    create_lock_release
-
-    log_debug "split-window: pane ${NEW_PANE_ID} ready"
-
-    # If the caller passed a command (not via send-keys), deliver it now
-    # and wait for the wrapper to rename the pane before returning focus.
+    # If the caller passed a command inline (not via a later send-keys), deliver
+    # it over the FIFO now and wait for the wrapper to rename the pane.
     if [ ${#sw_command[@]} -gt 0 ]; then
         local_fifo="${STATE_DIR}/${PANE_KEY}.fifo"
         if [ -p "$local_fifo" ]; then
@@ -445,9 +458,6 @@ split-window)
         fi
         wait_for_named "$PANE_KEY"
     fi
-    # If no inline command, DON'T move focus — the agent pane keeps focus so
-    # the subsequent send-keys → wrapper → rename-pane targets the right pane.
-    # send-keys will move focus back after the rename is locked.
 
     # Print pane ID if -P was given
     if [ "$sw_print" = true ]; then
@@ -741,28 +751,15 @@ new-window)
     PANE_KEY="${NEW_PANE_ID#%}"
     validate_pane_key "$PANE_KEY" || { log_debug "new-window: invalid pane key"; exit 1; }
 
-    log_debug "new-window: creating pane ${NEW_PANE_ID} name=${nw_name}"
-
-    # Tag this pane with the caller's zellij pane ID (for tab-scoped stacking)
-    echo "${ZELLIJ_PANE_ID:-0}" > "${STATE_DIR}/${PANE_KEY}.group"
-
-    # Snapshot env so the wrapper can restore it in the new pane
-    snapshot_env
-
-    # Build zellij command
-    zellij_args=(action new-pane --close-on-exit -d right)
-    if [ -n "$nw_name" ]; then
-        zellij_args+=(-n "$nw_name")
-    fi
-
-    zellij "${zellij_args[@]}" -- "${SHIM_DIR}/bin/zellij-pane-wrapper" "$STATE_DIR" "$SHIM_DIR" "$NEW_PANE_ID" > /dev/null 2>&1 &
-
-    if ! wait_for_ready "$PANE_KEY"; then
-        log_debug "new-window: pane ${NEW_PANE_ID} failed to become ready"
+    # Create the pane on the Claude Code tab (shared, tab-pinned + stacked path).
+    # new-window is legacy — modern Claude Code uses split-window + respawn-pane
+    # — but routing it through the same function keeps behavior correct if any
+    # client still calls it. The tmux window name maps to the zellij pane name.
+    if ! spawn_agent_pane "$NEW_PANE_ID" "right" "$nw_name"; then
         exit 1
     fi
 
-    # Deliver command if provided, then wait for rename and refocus
+    # Deliver command if provided, then wait for the wrapper to rename the pane.
     if [ ${#nw_command[@]} -gt 0 ]; then
         local_fifo="${STATE_DIR}/${PANE_KEY}.fifo"
         if [ -p "$local_fifo" ]; then
@@ -770,8 +767,6 @@ new-window)
         fi
         wait_for_named "$PANE_KEY"
     fi
-    # If no inline command, DON'T move focus — send-keys will handle it
-    # after the wrapper renames the pane.
 
     if [ "$nw_print" = true ]; then
         echo "$NEW_PANE_ID"
